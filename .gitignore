@@ -1,0 +1,17 @@
+.env
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+artifacts/
+dist/
+build/
+*.egg-info/
+vision_old.py
+nano_banana_old*.py
+pipeline_old.py
+.venv/
+.venv-win/
+.DS_Store
+*.log
+node_modules/
