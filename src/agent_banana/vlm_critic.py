@@ -260,4 +260,165 @@ class VLMCritic:
         )
 
 
-__all__ = ["VLMCritic", "CriticVerdict"]
+class OllamaVLMCritic:
+    """Uses Ollama locally as a VLM to verify edits semantically."""
+
+    def __init__(self, model: str = "llama3.2-vision", host: str = "http://localhost:11434"):
+        self.model = model
+        self.host = host.rstrip("/")
+
+    def verify_edit(self, original: Image.Image, result: Image.Image,
+                    instruction: str, target: str, verb: str = "remove") -> CriticVerdict:
+        orig_b64 = _image_to_base64(original)
+        result_b64 = _image_to_base64(result)
+        prompt_text = (
+            f"You are a strict image editing judge. "
+            f"Image 1 is the ORIGINAL. Image 2 is the RESULT. "
+            f"Instruction: '{instruction}'. Target: '{target}'. Action: '{verb}'. "
+            f"Count ALL instances of '{target}' in the original, and check if EACH one "
+            f"was edited in the result. If the instruction says all/every and ANY is missed, "
+            f"fulfilled must be false and score must be < 0.7. "
+            f"Return ONLY valid JSON matching this structure: "
+            f"{{\"fulfilled\": true/false, \"confidence\": 0.0-1.0, \"semantic_score\": 0.0-1.0, "
+            f"\"reasoning\": \"string\", \"residual_objects\": [\"string\"], \"suggestions\": [\"string\"]}}"
+        )
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt_text, "images": [orig_b64, result_b64]}],
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0.1},
+        }
+        url = f"{self.host}/api/chat"
+        req = request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                              headers={"Content-Type": "application/json"})
+        try:
+            with request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            response_text = data.get("message", {}).get("content", "")
+            return self._parse_response(response_text, instruction, target)
+        except Exception as exc:
+            return CriticVerdict(fulfilled=False, confidence=0.0, semantic_score=0.3,
+                                 reasoning=f"Ollama Critic unavailable: {exc}",
+                                 residual_objects=[], suggestions=["Start ollama serve"])
+
+    def _parse_response(self, text: str, instruction: str, target: str) -> CriticVerdict:
+        try:
+            return self._verdict_from_dict(json.loads(text.strip()))
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            m = re.search(r'\{[\s\S]*\}', text)
+            if m:
+                return self._verdict_from_dict(json.loads(m.group()))
+        except (json.JSONDecodeError, ValueError):
+            pass
+        score = 0.4
+        m = re.search(r'"semantic_score"[\s:]+([\d.]+)', text)
+        if m:
+            score = float(m.group(1))
+        return CriticVerdict(fulfilled=score >= 0.7, confidence=0.3, semantic_score=score,
+                             reasoning=text[:500] or "Parse error", residual_objects=[],
+                             suggestions=["Could not parse Ollama response"])
+
+    def _verdict_from_dict(self, data: dict) -> CriticVerdict:
+        return CriticVerdict(
+            fulfilled=bool(data.get("fulfilled", False)),
+            confidence=float(data.get("confidence", 0.5)),
+            semantic_score=float(data.get("semantic_score", 0.5)),
+            reasoning=str(data.get("reasoning", "No reasoning provided")),
+            residual_objects=list(data.get("residual_objects", [])),
+            suggestions=list(data.get("suggestions", [])),
+        )
+
+
+class HuggingFaceVLMCritic:
+    """Uses Hugging Face Serverless Inference API as a VLM to verify edits."""
+
+    def __init__(self, api_token: str, model: str = "meta-llama/Llama-3.2-11B-Vision-Instruct"):
+        self.api_token = api_token
+        self.model = model
+        self.base_url = f"https://router.huggingface.co/hf-inference/models/{self.model}/v1/chat/completions"
+
+    def verify_edit(self, original: Image.Image, result: Image.Image,
+                    instruction: str, target: str, verb: str = "remove") -> CriticVerdict:
+        orig_img = original.copy(); orig_img.thumbnail((512, 512))
+        res_img = result.copy(); res_img.thumbnail((512, 512))
+        orig_b64 = _image_to_base64(orig_img)
+        result_b64 = _image_to_base64(res_img)
+        prompt_text = (
+            f"You are a strict image editing judge. "
+            f"Image 1 is the ORIGINAL. Image 2 is the RESULT. "
+            f"Instruction: '{instruction}'. Target: '{target}'. Action: '{verb}'. "
+            f"Count ALL instances of '{target}' in the original, check if EACH was edited. "
+            f"Return ONLY valid JSON (no markdown): "
+            f"{{\"fulfilled\": true, \"confidence\": 0.9, \"semantic_score\": 0.9, "
+            f"\"reasoning\": \"string\", \"residual_objects\": [], \"suggestions\": []}}"
+        )
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{orig_b64}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{result_b64}"}},
+            ]}],
+            "max_tokens": 500,
+            "temperature": 0.1,
+            "stream": False,
+        }
+        req = request.Request(self.base_url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                              headers={"Content-Type": "application/json",
+                                       "Authorization": f"Bearer {self.api_token}"})
+        try:
+            with request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            choices = data.get("choices", [])
+            if not choices:
+                raise ValueError("No choices in response")
+            response_text = choices[0].get("message", {}).get("content", "")
+            return self._parse_response(response_text, instruction, target)
+        except error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            return self._fallback_error(f"Hugging Face API Error {e.code}: {err_body[:200]}")
+        except Exception as exc:
+            return self._fallback_error(f"HF Critic unavailable: {exc}")
+
+    def _fallback_error(self, msg: str) -> CriticVerdict:
+        return CriticVerdict(fulfilled=False, confidence=0.0, semantic_score=0.3,
+                             reasoning=msg, residual_objects=[],
+                             suggestions=["Hugging Face connection failed — check API token"])
+
+    def _parse_response(self, text: str, instruction: str, target: str) -> CriticVerdict:
+        text = text.strip()
+        for pattern in [None, r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', r'\{[\s\S]*\}']:
+            try:
+                if pattern is None:
+                    data = json.loads(text)
+                else:
+                    m = re.search(pattern, text)
+                    if not m:
+                        continue
+                    data = json.loads(m.group(1) if m.lastindex else m.group())
+                return self._verdict_from_dict(data)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        score = 0.4
+        m = re.search(r'"semantic_score"[\s:]+([\d.]+)', text)
+        if m:
+            score = float(m.group(1))
+        return CriticVerdict(fulfilled=score >= 0.7, confidence=0.3, semantic_score=score,
+                             reasoning=text[:500] or "Parse error", residual_objects=[],
+                             suggestions=["Could not parse HF response"])
+
+    def _verdict_from_dict(self, data: dict) -> CriticVerdict:
+        return CriticVerdict(
+            fulfilled=bool(data.get("fulfilled", False)),
+            confidence=float(data.get("confidence", 0.5)),
+            semantic_score=float(data.get("semantic_score", 0.5)),
+            reasoning=str(data.get("reasoning", "No reasoning provided")),
+            residual_objects=list(data.get("residual_objects", [])),
+            suggestions=list(data.get("suggestions", [])),
+        )
+
+
+__all__ = ["VLMCritic", "OllamaVLMCritic", "HuggingFaceVLMCritic", "CriticVerdict"]
