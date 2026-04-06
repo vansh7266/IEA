@@ -1,3 +1,4 @@
+import os
 from __future__ import annotations
 
 import argparse
@@ -1141,7 +1142,7 @@ def make_handler(app: AgentBananaApp) -> Callable[..., BaseHTTPRequestHandler]:
 
 
 def main() -> None:
-    default_root = Path(__file__).resolve().parents[2]
+    default_root = Path(os.environ.get("AGENT_ROOT", "/tmp/agent_banana"))
     parser = argparse.ArgumentParser(description="Serve the Agent Banana image editing demo over HTTP.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
